@@ -1,0 +1,5 @@
+node_modules/
+_*.txt
+_*.cjs
+_*.mjs
+package-lock.json

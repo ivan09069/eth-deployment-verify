@@ -1,0 +1,34 @@
+name: "Verify Deployed Contract"
+description: "Verify that deployed bytecode matches compiled source from Etherscan"
+author: "ivan09069"
+
+inputs:
+  address:
+    description: "Contract address to verify"
+    required: true
+  network:
+    description: "Network name (mainnet, sepolia, goerli, polygon, arbitrum, optimism, base)"
+    required: true
+    default: "mainnet"
+  etherscan-key:
+    description: "Etherscan API key"
+    required: true
+  rpc-url:
+    description: "Custom RPC URL (overrides default public RPC)"
+    required: false
+
+outputs:
+  status:
+    description: "PASS or FAIL"
+  on-chain-hash:
+    description: "Keccak256 of normalized on-chain bytecode"
+  compiled-hash:
+    description: "Keccak256 of normalized compiled bytecode"
+
+runs:
+  using: "node20"
+  main: "index.mjs"
+
+branding:
+  icon: "check-circle"
+  color: "green"
