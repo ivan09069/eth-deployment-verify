@@ -5,6 +5,7 @@ import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { detectProxy, lookupBlockscoutProxy } from "./proxy-detection.mjs";
 var __dirname = dirname(fileURLToPath(import.meta.url));
 
 const isAction = !!process.env.GITHUB_ACTIONS;
@@ -239,6 +240,7 @@ async function main() {
   var address = getInput("address") || process.argv[2] || "";
   var network = getInput("network") || process.argv[3] || "mainnet";
   var etherscanKey = getInput("etherscan-key") || process.argv[4] || process.env.ETHERSCAN_API_KEY || "";
+  var blockscoutKey = getInput("blockscout-key") || process.env.BLOCKSCOUT_API_KEY || "";
   var rpcUrl = getInput("rpc-url") || process.argv[5] || "";
   if (!address) die("Missing address");
   var net = NETWORKS[network.toLowerCase()];
@@ -279,6 +281,44 @@ async function main() {
     var onChain = await rpcCall(rpcUrl, "eth_getCode", [address, "latest"]);
     if (!onChain || onChain === "0x") die("No bytecode at address");
     info("on-chain: " + ((onChain.length - 2) / 2) + " bytes");
+
+    info("Checking proxy signals...");
+    var blockscoutProxy = await lookupBlockscoutProxy({
+      chainId: net.chainId,
+      address: address,
+      apiKey: blockscoutKey,
+      instanceBase: BLOCKSCOUT[net.chainId],
+    });
+    var proxy = await detectProxy({
+      bytecode: onChain,
+      contractName: src.contractName,
+      blockscout: blockscoutProxy,
+      readStorage: function(slot) {
+        return rpcCall(rpcUrl, "eth_getStorageAt", [address, slot, "latest"]);
+      },
+    });
+    if (proxy.isProxy) {
+      console.log("\n" + sep);
+      console.log("  SKIP: proxy contract detected");
+      console.log("  contract=" + src.contractName);
+      console.log("  proxy_signals=" + proxy.signals.join(","));
+      console.log("  proxy_bytecode_len=" + proxy.byteLength);
+      if (proxy.proxyType) console.log("  proxy_type=" + proxy.proxyType);
+      if (proxy.implementation) {
+        console.log("  implementation=" + proxy.implementation);
+        if (proxy.implementationName) console.log("  implementation_name=" + proxy.implementationName);
+        console.log("  next=node index.mjs " + proxy.implementation + " " + network);
+        setOutput("implementation-address", proxy.implementation);
+      } else {
+        console.log("  implementation=unknown");
+        console.log("  next=resolve the implementation address, then verify it directly");
+      }
+      setOutput("proxy", "true");
+      setOutput("status", "SKIP");
+      console.log(sep + "\n");
+      process.exit(0);
+    }
+    setOutput("proxy", "false");
 
     var solcPath = await downloadSolc(src.compilerVersion);
     var stdInput = buildStdInput(src);
