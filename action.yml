@@ -13,6 +13,9 @@ inputs:
   etherscan-key:
     description: "Etherscan API key"
     required: true
+  blockscout-key:
+    description: "Blockscout PRO API key (optional; falls back to per-instance lookup and bytecode heuristics)"
+    required: false
   rpc-url:
     description: "Custom RPC URL (overrides default public RPC)"
     required: false
@@ -20,6 +23,10 @@ inputs:
 outputs:
   status:
     description: "PASS or FAIL"
+  proxy:
+    description: "true when the target is detected as a proxy"
+  implementation-address:
+    description: "Resolved proxy implementation address, when available"
   on-chain-hash:
     description: "Keccak256 of normalized on-chain bytecode"
   compiled-hash:
