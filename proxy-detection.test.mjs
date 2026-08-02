@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   containsDelegatecall,
   detectProxy,
@@ -58,5 +59,13 @@ test("extracts the implementation from an EIP-1967 storage word", () => {
   assert.equal(
     implementationFromStorage("0x" + "00".repeat(12) + IMPLEMENTATION.slice(2)),
     IMPLEMENTATION,
+  );
+});
+
+test("runs proxy detection before the legacy compiler gate", () => {
+  const cli = readFileSync(new URL("./index.mjs", import.meta.url), "utf8");
+  assert.ok(
+    cli.indexOf('info("Checking proxy signals...")') <
+      cli.indexOf("// Gate compilation only after proxy detection"),
   );
 });
