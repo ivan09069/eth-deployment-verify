@@ -265,18 +265,6 @@ async function main() {
     var optStr = src.optimizationUsed ? "on(" + src.runs + ")" : "off";
     info("optimizer=" + optStr + " evm=" + src.evmVersion);
 
-    // Gate: legacy solc
-    var vm = String(src.compilerVersion).match(/(\d+)\.(\d+)\.(\d+)/);
-    if (vm && Number(vm[1]) === 0 && Number(vm[2]) < 5) {
-      console.log("\n" + sep);
-      console.log("  SKIP: unsupported compiler runtime");
-      console.log("  solc=" + src.compilerVersion);
-      console.log("  reason=legacy soljson incompatible with current Node runtime");
-      console.log(sep + "\n");
-      setOutput("status", "SKIP");
-      process.exit(0);
-    }
-
     info("Fetching on-chain bytecode...");
     var onChain = await rpcCall(rpcUrl, "eth_getCode", [address, "latest"]);
     if (!onChain || onChain === "0x") die("No bytecode at address");
@@ -319,6 +307,19 @@ async function main() {
       process.exit(0);
     }
     setOutput("proxy", "false");
+
+    // Gate compilation only after proxy detection. Legacy proxy bytecode can
+    // still be resolved without loading its old soljson runtime.
+    var vm = String(src.compilerVersion).match(/(\d+)\.(\d+)\.(\d+)/);
+    if (vm && Number(vm[1]) === 0 && Number(vm[2]) < 5) {
+      console.log("\n" + sep);
+      console.log("  SKIP: unsupported compiler runtime");
+      console.log("  solc=" + src.compilerVersion);
+      console.log("  reason=legacy soljson incompatible with current Node runtime");
+      console.log(sep + "\n");
+      setOutput("status", "SKIP");
+      process.exit(0);
+    }
 
     var solcPath = await downloadSolc(src.compilerVersion);
     var stdInput = buildStdInput(src);
