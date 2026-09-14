@@ -1,15 +1,10 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
-import { writeFileSync, mkdirSync, existsSync, appendFileSync } from "node:fs";
-import { execSync } from "node:child_process";
-import { join, dirname } from "node:path";
-import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { appendFileSync } from "node:fs";
 import { detectProxy, lookupBlockscoutProxy } from "./proxy-detection.mjs";
-var __dirname = dirname(fileURLToPath(import.meta.url));
+import { downloadSolc, compileSolidity, bytecodeSha256, getActionInput, removeDownloadedCompiler } from "./compiler-security.mjs";
 
 const isAction = !!process.env.GITHUB_ACTIONS;
-function getInput(n) { return process.env["INPUT_" + n.toUpperCase().replace(/-/g, "_")] || ""; }
+const getInput = getActionInput;
 function setOutput(n, v) { if (isAction && process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, n + "=" + v + "\n"); }
 function die(m) { console.error(isAction ? "::error::" + m : "FAIL: " + m); process.exit(1); }
 function info(m) { console.log("  " + m); }
@@ -33,7 +28,7 @@ const BLOCKSCOUT = {
 
 async function fetchJSON(url) {
   var r = await fetch(url);
-  if (!r.ok) throw new Error("HTTP " + r.status + ": " + url);
+  if (!r.ok) throw new Error("Provider HTTP " + r.status);
   return r.json();
 }
 async function rpcCall(rpcUrl, method, params) {
@@ -130,23 +125,6 @@ async function tryEtherscan(chainId, address, apiKey) {
   } catch (e) { return null; }
 }
 
-async function downloadSolc(version) {
-  var ver = version.split("+")[0];
-  var dir = join(tmpdir(), "eth-deploy-verify");
-  mkdirSync(dir, { recursive: true });
-  var solcPath = join(dir, "soljson-" + ver + ".js");
-  if (existsSync(solcPath)) { info("solc " + ver + " cached"); return solcPath; }
-  info("Downloading solc-js " + ver + "...");
-  var list = await fetchJSON("https://binaries.soliditylang.org/bin/list.json");
-  var file = list.releases && list.releases[ver];
-  if (!file) throw new Error("solc " + ver + " not in releases");
-  var resp = await fetch("https://binaries.soliditylang.org/bin/" + file);
-  if (!resp.ok) throw new Error("solc download failed: " + resp.status);
-  writeFileSync(solcPath, Buffer.from(await resp.arrayBuffer()));
-  info("solc " + ver + " ready");
-  return solcPath;
-}
-
 function buildStdInput(src) {
   var sources = src.sources;
   if (Object.keys(sources).length === 0 && src.sourceCode) {
@@ -165,46 +143,6 @@ function buildStdInput(src) {
   };
 }
 
-function compileSolidity(solcPath, stdInput) {
-  var dir = join(tmpdir(), "eth-deploy-verify");
-  var wrapper = join(dir, "_compile.cjs");
-  var escaped = solcPath.replace(/\\/g, "\\\\");
-  var code =
-    "var solc = require(\"solc\");\n" +
-    "var soljson = require(\"" + escaped + "\");\n" +
-    "var compiler = solc.setupMethods(soljson);\n" +
-    "var inp = require(\"fs\").readFileSync(0, \"utf8\");\n" +
-    "var out = compiler.compile(inp);\n" +
-    "process.stdout.write(out);\n";
-  writeFileSync(wrapper, code);
-  var out;
-  try {
-    out = execSync("node \"" + wrapper + "\"", {
-      input: JSON.stringify(stdInput), encoding: "utf-8",
-      timeout: 120000, maxBuffer: 50 * 1024 * 1024,
-      cwd: __dirname, stdio: ["pipe", "pipe", "ignore"],
-      env: Object.assign({}, process.env, { NODE_PATH: join(__dirname, "node_modules") }),
-    });
-  } catch (e) {
-    throw new Error("solc failed: " + (e.stdout || e.message || "").slice(0, 300));
-  }
-  var result = JSON.parse(out);
-  if (result.errors) {
-    var errs = result.errors.filter(function(e) { return e.severity === "error"; });
-    if (errs.length) throw new Error("Compile errors:\n" + errs.map(function(e) { return e.formattedMessage || e.message; }).join("\n").slice(0, 500));
-  }
-  var all = [];
-  for (var file in result.contracts || {}) {
-    for (var name in result.contracts[file]) {
-      var bc = result.contracts[file][name].evm;
-      bc = bc && bc.deployedBytecode && bc.deployedBytecode.object;
-      if (bc && bc.length > 2) all.push({ file: file, name: name, bytecode: "0x" + bc });
-    }
-  }
-  if (!all.length) throw new Error("No bytecode in compilation output");
-  return all;
-}
-
 function stripMeta(bytecode) {
   var hex = bytecode.startsWith("0x") ? bytecode.slice(2) : bytecode;
   // solc >=0.5.9: CBOR length in last 2 bytes
@@ -217,10 +155,6 @@ function stripMeta(bytecode) {
   // solc 0.4.x: a165627a7a72305820...(64 hex chars)...0029
   hex = hex.replace(/a165627a7a72305820[0-9a-fA-F]{64}0029$/, "");
   return hex;
-}
-
-function keccak(hex) {
-  return createHash("sha256").update(hex).digest("hex").slice(0, 16);
 }
 
 function pickBestMatch(onChainHex, candidates) {
@@ -242,7 +176,7 @@ async function main() {
   var etherscanKey = getInput("etherscan-key") || process.argv[4] || process.env.ETHERSCAN_API_KEY || "";
   var blockscoutKey = getInput("blockscout-key") || process.env.BLOCKSCOUT_API_KEY || "";
   var rpcUrl = getInput("rpc-url") || process.argv[5] || "";
-  if (!address) die("Missing address");
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) die("Invalid contract address");
   var net = NETWORKS[network.toLowerCase()];
   if (!net) die("Unknown network: " + network);
   if (!rpcUrl) rpcUrl = net.rpc;
@@ -325,7 +259,9 @@ async function main() {
     var stdInput = buildStdInput(src);
 
     info("Compiling...");
-    var candidates = compileSolidity(solcPath, stdInput);
+    var candidates;
+    try { candidates = compileSolidity(solcPath, stdInput); }
+    finally { removeDownloadedCompiler(solcPath); }
     info("compiled " + candidates.length + " contract(s): " + candidates.map(function(c) { return c.name; }).join(", "));
 
     var result = pickBestMatch(onChain, candidates);
@@ -338,7 +274,7 @@ async function main() {
       console.log("  provider=" + src.provider);
       console.log("  solc=" + src.compilerVersion);
       console.log("  contract=" + result.name);
-      console.log("  keccak=" + keccak(onStrip));
+      console.log("  sha256=" + bytecodeSha256(onStrip));
       setOutput("status", "PASS");
     } else {
       console.log("  FAIL: bytecode mismatch");
@@ -347,8 +283,8 @@ async function main() {
       console.log("  closest_contract=" + result.name);
       console.log("  onchain_len=" + (onStrip.length / 2));
       console.log("  compiled_len=" + (comStrip.length / 2));
-      console.log("  onchain_keccak=" + keccak(onStrip));
-      console.log("  compiled_keccak=" + keccak(comStrip));
+      console.log("  onchain_sha256=" + bytecodeSha256(onStrip));
+      console.log("  compiled_sha256=" + bytecodeSha256(comStrip));
       // Find first diff byte
       var firstDiff = -1;
       for (var d = 0; d < Math.min(onStrip.length, comStrip.length); d += 2) {
@@ -357,8 +293,9 @@ async function main() {
       console.log("  first_diff_at=byte " + firstDiff + " (of " + (onStrip.length/2) + ")");
       setOutput("status", "FAIL");
     }
-    setOutput("on-chain-hash", keccak(onStrip));
-    setOutput("compiled-hash", keccak(comStrip));
+    setOutput("hash-algorithm", "sha256");
+    setOutput("on-chain-hash", bytecodeSha256(onStrip));
+    setOutput("compiled-hash", bytecodeSha256(comStrip));
     console.log(sep + "\n");
     if (!result.match) process.exit(1);
   } catch (err) {

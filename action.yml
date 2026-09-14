@@ -22,15 +22,17 @@ inputs:
 
 outputs:
   status:
-    description: "PASS or FAIL"
+    description: "PASS, FAIL, or SKIP (SKIP is not verification success)"
   proxy:
     description: "true when the target is detected as a proxy"
   implementation-address:
     description: "Resolved proxy implementation address, when available"
+  hash-algorithm:
+    description: "sha256; hashes cover decoded normalized bytecode bytes"
   on-chain-hash:
-    description: "Keccak256 of normalized on-chain bytecode"
+    description: "SHA-256 of normalized on-chain bytecode"
   compiled-hash:
-    description: "Keccak256 of normalized compiled bytecode"
+    description: "SHA-256 of normalized compiled bytecode"
 
 runs:
   using: "node20"
