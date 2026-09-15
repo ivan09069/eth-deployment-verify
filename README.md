@@ -55,16 +55,3 @@ solc=0.5.12+commit.7709ece9
 contract=Dai
 keccak=d185ab42211e2b3f
 ```
-
-## Verification boundaries
-
-Compiler downloads are checked against the official manifest's SHA-256 and stored
-in a unique private temporary directory. The compiler wrapper uses argument-based
-process execution. Compiler failures do not print source contents or credentials.
-
-Hash outputs are full SHA-256 hashes of decoded, normalized bytecode bytes. Earlier
-versions mislabeled truncated SHA-256 strings as Keccak. `hash-algorithm=sha256`
-now makes the algorithm explicit. This is separate from the byte-for-byte match.
-A `SKIP` result is inconclusive and must not be accepted as a successful release gate.
-Immutable values, exact compiler settings, linked libraries, and proxy implementation
-verification remain additional checks before relying on this tool for production.
