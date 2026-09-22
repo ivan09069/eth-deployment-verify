@@ -55,3 +55,8 @@ solc=0.5.12+commit.7709ece9
 contract=Dai
 keccak=d185ab42211e2b3f
 ```
+
+## License
+
+Copyright (c) 2026 EchoForge Studios. All rights reserved.
+No use or copy is permitted without a written license. See [LICENSE](LICENSE).
