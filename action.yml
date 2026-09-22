@@ -1,5 +1,5 @@
 name: "Verify Deployed Contract"
-description: "Verify that deployed bytecode matches compiled source from Etherscan"
+description: "Verify deployed bytecode against compiled source through Sourcify, Blockscout, and Etherscan"
 author: "ivan09069"
 
 inputs:
