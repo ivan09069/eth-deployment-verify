@@ -1,3 +1,5 @@
+import { fetchBounded } from "./bounded-fetch.mjs";
+
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const EIP1967_IMPLEMENTATION_SLOT =
   "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
@@ -49,7 +51,7 @@ export function implementationFromStorage(storageWord) {
   return normalizeAddress("0x" + hex.slice(-40));
 }
 
-export async function lookupBlockscoutProxy({ chainId, address, apiKey, instanceBase, fetchImpl = fetch }) {
+export async function lookupBlockscoutProxy({ chainId, address, apiKey, instanceBase, fetchImpl = fetch, timeoutMs = 20000 }) {
   if (!ADDRESS_RE.test(address)) return null;
   const urls = [];
   if (apiKey) {
@@ -58,9 +60,9 @@ export async function lookupBlockscoutProxy({ chainId, address, apiKey, instance
   if (instanceBase) urls.push(`${instanceBase}/api/v2/addresses/${address}`);
   for (const url of urls) {
     try {
-      const response = await fetchImpl(url);
-      if (!response.ok) continue;
-      const data = await response.json();
+      const opened = await fetchBounded(url, timeoutMs, fetchImpl, { read: "json" });
+      if (!opened.ok || !opened.data) continue;
+      const data = opened.data;
       const implementation = implementationFromBlockscout(data);
       if (implementation) {
         return {

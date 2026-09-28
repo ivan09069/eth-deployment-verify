@@ -62,10 +62,49 @@ test("extracts the implementation from an EIP-1967 storage word", () => {
   );
 });
 
+test("bounds a blockscout lookup that never responds", { timeout: 3000 }, async () => {
+  const started = Date.now();
+  const lookup = await lookupBlockscoutProxy({
+    chainId: 1,
+    address: "0x2222222222222222222222222222222222222222",
+    instanceBase: "https://eth.blockscout.com",
+    timeoutMs: 50,
+    fetchImpl: () => new Promise(() => {}),
+  });
+  assert.equal(lookup, null);
+  assert.ok(Date.now() - started < 2000);
+});
+
+test("bounds a blockscout body that never arrives", { timeout: 3000 }, async () => {
+  const started = Date.now();
+  const lookup = await lookupBlockscoutProxy({
+    chainId: 1,
+    address: "0x2222222222222222222222222222222222222222",
+    instanceBase: "https://eth.blockscout.com",
+    timeoutMs: 50,
+    fetchImpl: async () => ({ ok: true, json: () => new Promise(() => {}) }),
+  });
+  assert.equal(lookup, null);
+  assert.ok(Date.now() - started < 2000);
+});
+
 test("runs proxy detection before the legacy compiler gate", () => {
   const cli = readFileSync(new URL("./index.mjs", import.meta.url), "utf8");
   assert.ok(
     cli.indexOf('info("Checking proxy signals...")') <
       cli.indexOf("// Gate compilation only after proxy detection"),
   );
+});
+test("passes an abort signal to Blockscout proxy lookups", async () => {
+  let signal;
+  await lookupBlockscoutProxy({
+    chainId: 1,
+    address: "0x2222222222222222222222222222222222222222",
+    instanceBase: "https://eth.blockscout.com",
+    fetchImpl: async (_url, options) => {
+      signal = options?.signal;
+      return { ok: false, status: 503, json: async () => ({}) };
+    },
+  });
+  assert.ok(signal instanceof AbortSignal);
 });
