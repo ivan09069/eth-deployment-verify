@@ -11,8 +11,8 @@ inputs:
     required: true
     default: "mainnet"
   etherscan-key:
-    description: "Etherscan API key"
-    required: true
+    description: "Etherscan API key (optional fallback after Sourcify and Blockscout)"
+    required: false
   blockscout-key:
     description: "Blockscout PRO API key (optional; falls back to per-instance lookup and bytecode heuristics)"
     required: false
@@ -28,9 +28,9 @@ outputs:
   implementation-address:
     description: "Resolved proxy implementation address, when available"
   on-chain-hash:
-    description: "Keccak256 of normalized on-chain bytecode"
+    description: "First 16 hex characters of SHA-256 of the normalized on-chain bytecode hex"
   compiled-hash:
-    description: "Keccak256 of normalized compiled bytecode"
+    description: "First 16 hex characters of SHA-256 of the normalized compiled bytecode hex"
 
 runs:
   using: "node20"
