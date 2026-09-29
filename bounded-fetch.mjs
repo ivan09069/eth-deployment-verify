@@ -11,7 +11,6 @@ export async function withTimeout(timeoutMs, run) {
     controller.abort(error);
     rejectAbort(error);
   }, timeoutMs);
-  if (typeof timer.unref === "function") timer.unref();
   const task = Promise.resolve().then(() => run(controller.signal));
   task.catch(() => {});
   try {

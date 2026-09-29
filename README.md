@@ -63,7 +63,7 @@ contract=Dai
 fingerprint=d185ab42211e2b3f
 ```
 
-`fingerprint` is the first 16 hex characters of SHA-256 over the normalized bytecode hex text. Sourcify is used when its repository responds. This sample is the Dai run with Blockscout source.
+`fingerprint` is the first 16 hex characters of SHA-256 over the normalized bytecode hex text. Sourcify is used when its API returns a runtime match with complete source. This sample is the Dai run with Blockscout source.
 
 ## License
 

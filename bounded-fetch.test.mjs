@@ -39,6 +39,28 @@ test("withTimeout returns a completed request", async () => {
   assert.equal(value, "ok");
 });
 
+test("a never-settling task still rejects and lets the process exit", () => {
+  const href = new URL("./bounded-fetch.mjs", import.meta.url).href;
+  const code = [
+    "import { withTimeout } from " + JSON.stringify(href) + ";",
+    "const started = Date.now();",
+    "try {",
+    "  await withTimeout(80, () => new Promise(() => {}));",
+    "  console.log('NO');",
+    "} catch (error) {",
+    "  console.log('ERR ' + error.name + ' ' + (Date.now() - started));",
+    "}",
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    encoding: "utf8",
+    timeout: 5000,
+  });
+  assert.equal(result.status, 0, (result.stderr || "") + (result.stdout || ""));
+  assert.match(result.stdout, /ERR TimeoutError (\d+)/);
+  const elapsed = Number(result.stdout.match(/ERR TimeoutError (\d+)/)[1]);
+  assert.ok(elapsed < 4000);
+});
+
 test("fetchBounded reads json from a local server", async () => {
   const server = await listen((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });

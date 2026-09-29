@@ -62,6 +62,28 @@ test("extracts the implementation from an EIP-1967 storage word", () => {
   );
 });
 
+test("a hanging blockscout pro lookup falls through to the instance", { timeout: 3000 }, async () => {
+  const urls = [];
+  const started = Date.now();
+  const lookup = await lookupBlockscoutProxy({
+    chainId: 1,
+    address: "0x2222222222222222222222222222222222222222",
+    apiKey: "secret",
+    instanceBase: "https://eth.blockscout.com",
+    timeoutMs: 40,
+    fetchImpl: (url) => {
+      urls.push(String(url));
+      if (String(url).includes("api.blockscout.com")) return new Promise(() => {});
+      return { ok: true, json: async () => ({ implementations: [{ address_hash: IMPLEMENTATION }] }) };
+    },
+  });
+  assert.equal(lookup.implementation, IMPLEMENTATION);
+  assert.equal(lookup.source, "blockscout");
+  assert.equal(urls.length, 2);
+  assert.equal(urls.some((url) => url.includes("apikey=secret")), true);
+  assert.ok(Date.now() - started < 2000);
+});
+
 test("bounds a blockscout lookup that never responds", { timeout: 3000 }, async () => {
   const started = Date.now();
   const lookup = await lookupBlockscoutProxy({

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { writeFileSync, mkdirSync, existsSync, appendFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, existsSync, appendFileSync, realpathSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { fetchBounded } from "./bounded-fetch.mjs";
 import { detectProxy, lookupBlockscoutProxy } from "./proxy-detection.mjs";
 var __dirname = dirname(fileURLToPath(import.meta.url));
@@ -51,8 +51,8 @@ function rpcLabel(url) {
   }
 }
 
-async function rpcOnce(rpcUrl, method, params) {
-  var opened = await fetchBounded(rpcUrl, API_TIMEOUT_MS, fetch, {
+async function rpcOnce(rpcUrl, method, params, fetchImpl) {
+  var opened = await fetchBounded(rpcUrl, API_TIMEOUT_MS, fetchImpl || fetch, {
     read: "json",
     options: {
       method: "POST",
@@ -62,12 +62,13 @@ async function rpcOnce(rpcUrl, method, params) {
   });
   if (!opened.ok) throw new Error("HTTP " + opened.status);
   var d = opened.data;
-  if (!d || typeof d !== "object") throw new Error("RPC: empty response");
+  if (!d || typeof d !== "object" || Array.isArray(d)) throw new Error("RPC: empty response");
   if (d.error) throw new Error("RPC: " + (d.error.message || d.error.code));
+  if (!Object.prototype.hasOwnProperty.call(d, "result")) throw new Error("RPC: missing result");
   return d.result;
 }
 
-function createRpc(urls) {
+export function createRpc(urls, fetchImpl) {
   var list = urls.slice();
   var pinned = -1;
   return async function(method, params) {
@@ -80,7 +81,7 @@ function createRpc(urls) {
     for (var n = 0; n < order.length; n++) {
       var idx = order[n];
       try {
-        var result = await rpcOnce(list[idx], method, params);
+        var result = await rpcOnce(list[idx], method, params, fetchImpl);
         if (idx !== 0 && pinned !== idx) info("rpc=" + rpcLabel(list[idx]));
         pinned = idx;
         return result;
@@ -92,50 +93,50 @@ function createRpc(urls) {
   };
 }
 
+function sourcifyArtifact(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  if (data.runtimeMatch !== "exact_match" && data.runtimeMatch !== "match") return null;
+  var compilation = data.compilation || {};
+  var version = String(compilation.compilerVersion || "").replace(/^v/, "");
+  var entries = Object.entries(data.sources || {});
+  if (!version || !entries.length) return null;
+  var sources = {};
+  for (var i = 0; i < entries.length; i++) {
+    var content = entries[i][1] && entries[i][1].content;
+    if (typeof content !== "string" || content.length === 0) return null;
+    sources[entries[i][0]] = { content: content };
+  }
+  var settings = compilation.compilerSettings || {};
+  var opt = settings.optimizer || {};
+  var cName = compilation.name || "";
+  if (!cName && compilation.fullyQualifiedName) {
+    var parts = String(compilation.fullyQualifiedName).split(":");
+    cName = parts[parts.length - 1] || "";
+  }
+  return {
+    provider: "sourcify", contractName: cName,
+    compilerVersion: version,
+    optimizationUsed: !!opt.enabled, runs: opt.runs || 200,
+    evmVersion: settings.evmVersion || "default", sources: sources, settings: settings,
+  };
+}
+
 async function trySourcify(chainId, address, fetchImpl = fetch, timeoutMs = SOURCE_TIMEOUT_MS) {
   var addr = address.toLowerCase();
-  var matches = ["full_match", "partial_match"];
-  var sawOutage = false;
-  var outageDetail = "";
-  for (var i = 0; i < matches.length; i++) {
-    try {
-      var url = "https://repo.sourcify.dev/contracts/" + matches[i] + "/" + chainId + "/" + addr + "/metadata.json";
-      var opened = await fetchBounded(url, timeoutMs, fetchImpl, { read: "json" });
-      if (!opened.ok) {
-        if (opened.status >= 500) {
-          sawOutage = true;
-          outageDetail = "HTTP " + opened.status;
-        }
-        continue;
-      }
-      var meta = opened.data || {};
-      var settings = meta.settings || {};
-      var target = Object.entries(settings.compilationTarget || {});
-      var cName = target.length ? target[0][1] : "";
-      var sources = {};
-      var entries = Object.entries(meta.sources || {});
-      for (var j = 0; j < entries.length; j++) {
-        var p = entries[j][0], s = entries[j][1];
-        if (s.content) { sources[p] = { content: s.content }; continue; }
-        var srcUrl = "https://repo.sourcify.dev/contracts/" + matches[i] + "/" + chainId + "/" + addr + "/sources/" + p;
-        var srcOpened = await fetchBounded(srcUrl, timeoutMs, fetchImpl, { read: "text" });
-        if (srcOpened.ok) sources[p] = { content: srcOpened.data };
-      }
-      var opt = settings.optimizer || {};
-      return {
-        provider: "sourcify", contractName: cName,
-        compilerVersion: (meta.compiler && meta.compiler.version || "").replace(/^v/, ""),
-        optimizationUsed: !!opt.enabled, runs: opt.runs || 200,
-        evmVersion: settings.evmVersion || "default", sources: sources, settings: settings,
-      };
-    } catch (e) {
-      sawOutage = true;
-      outageDetail = explainFetch(e);
-      continue;
+  var url = "https://sourcify.dev/server/v2/contract/" + chainId + "/" + addr + "?fields=sources,compilation";
+  try {
+    var opened = await fetchBounded(url, timeoutMs, fetchImpl, { read: "json" });
+    if (!opened.ok) {
+      if (!opened.status || opened.status >= 500) info("Sourcify unavailable: HTTP " + opened.status);
+      return null;
     }
+    var artifact = sourcifyArtifact(opened.data);
+    if (!artifact) info("Sourcify artifact is not a complete runtime match");
+    return artifact;
+  } catch (e) {
+    info("Sourcify unavailable: " + explainFetch(e));
+    return null;
   }
-  if (sawOutage) info("Sourcify unavailable" + (outageDetail ? ": " + outageDetail : ""));
-  return null;
 }
 
 async function tryBlockscout(chainId, address, fetchImpl = fetch, timeoutMs = API_TIMEOUT_MS) {
@@ -443,12 +444,18 @@ async function main() {
   }
 }
 
+function samePath(left, right) {
+  return String(left).toLowerCase() === String(right).toLowerCase();
+}
+
 function isDirectRun() {
   var entry = process.argv[1];
   if (!entry) return false;
   try {
-    if (import.meta.url === pathToFileURL(entry).href) return true;
-    return fileURLToPath(import.meta.url).toLowerCase() === resolve(entry).toLowerCase();
+    var modulePath = fileURLToPath(import.meta.url);
+    var invokedPath = resolve(entry);
+    if (samePath(modulePath, invokedPath)) return true;
+    return samePath(realpathSync(modulePath), realpathSync(invokedPath));
   } catch (e) {
     return false;
   }
