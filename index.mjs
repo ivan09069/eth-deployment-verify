@@ -51,6 +51,16 @@ function rpcLabel(url) {
   }
 }
 
+// Results for the Ethereum methods used here must be hex data. "0x" is the
+// authoritative "no code" answer, so null or any non-hex value marks a broken
+// endpoint and must trigger failover instead of pinning that endpoint.
+const HEX_DATA = /^0x(?:[0-9a-fA-F]{2})*$/;
+const HEX_QUANTITY_OR_DATA = /^0x[0-9a-fA-F]*$/;
+const RPC_RESULT_CHECKS = {
+  eth_getCode: function(r) { return typeof r === "string" && HEX_DATA.test(r); },
+  eth_getStorageAt: function(r) { return typeof r === "string" && r.length > 2 && HEX_QUANTITY_OR_DATA.test(r); },
+};
+
 async function rpcOnce(rpcUrl, method, params, fetchImpl) {
   var opened = await fetchBounded(rpcUrl, API_TIMEOUT_MS, fetchImpl || fetch, {
     read: "json",
@@ -65,6 +75,8 @@ async function rpcOnce(rpcUrl, method, params, fetchImpl) {
   if (!d || typeof d !== "object" || Array.isArray(d)) throw new Error("RPC: empty response");
   if (d.error) throw new Error("RPC: " + (d.error.message || d.error.code));
   if (!Object.prototype.hasOwnProperty.call(d, "result")) throw new Error("RPC: missing result");
+  var check = RPC_RESULT_CHECKS[method];
+  if (check && !check(d.result)) throw new Error("RPC: invalid result for " + method);
   return d.result;
 }
 

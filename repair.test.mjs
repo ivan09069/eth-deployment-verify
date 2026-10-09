@@ -209,19 +209,47 @@ test("rpc skips a success body that omits result", async () => {
     if (String(url).includes("bad")) {
       return { ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: 1 }) };
     }
-    return { ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: 1, result: "0xabc" }) };
+    return { ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: 1, result: "0xabcd" }) };
   });
-  assert.equal(await rpc("eth_getCode", ["0x1", "latest"]), "0xabc");
+  assert.equal(await rpc("eth_getCode", ["0x1", "latest"]), "0xabcd");
   assert.deepEqual(seen, ["https://bad.example/rpc", "https://good.example/rpc"]);
 });
 
-test("rpc accepts an explicit null result", async () => {
+test("rpc fails over when eth_getCode returns invalid result types", async () => {
+  for (const bad of [null, 0, true, {}, [], "", "0xzz", "0xabc", "abcd"]) {
+    const seen = [];
+    const rpc = createRpc(["https://bad.example/rpc", "https://good.example/rpc"], async (url) => {
+      seen.push(String(url));
+      if (String(url).includes("bad")) {
+        return { ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: 1, result: bad }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: 1, result: "0x" }) };
+    });
+    assert.equal(await rpc("eth_getCode", ["0x1", "latest"]), "0x", "bad=" + JSON.stringify(bad));
+    assert.deepEqual(seen, ["https://bad.example/rpc", "https://good.example/rpc"]);
+    // The good endpoint is pinned; the bad one is not tried first next time.
+    seen.length = 0;
+    await rpc("eth_getCode", ["0x1", "latest"]);
+    assert.deepEqual(seen, ["https://good.example/rpc"]);
+  }
+});
+
+test("rpc rejects a null eth_getCode result when no endpoint is valid", async () => {
   const rpc = createRpc(["https://only.example/rpc"], async () => ({
     ok: true,
     status: 200,
     json: async () => ({ jsonrpc: "2.0", id: 1, result: null }),
   }));
-  assert.equal(await rpc("eth_getCode", []), null);
+  await assert.rejects(rpc("eth_getCode", ["0x1", "latest"]), /invalid result for eth_getCode/);
+});
+
+test("rpc rejects a null eth_getStorageAt result", async () => {
+  const rpc = createRpc(["https://only.example/rpc"], async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ jsonrpc: "2.0", id: 1, result: null }),
+  }));
+  await assert.rejects(rpc("eth_getStorageAt", ["0x1", "0x0", "latest"]), /invalid result for eth_getStorageAt/);
 });
 
 test("symlinked cli entry still reports a missing address", (t) => {
