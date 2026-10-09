@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { writeFileSync, mkdirSync, existsSync, appendFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, existsSync, appendFileSync, realpathSync } from "node:fs";
 import { execSync } from "node:child_process";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { fetchBounded } from "./bounded-fetch.mjs";
 import { detectProxy, lookupBlockscoutProxy } from "./proxy-detection.mjs";
 var __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -16,12 +17,12 @@ function info(m) { console.log("  " + m); }
 function warn(m) { console.log("  ! " + m); }
 
 const NETWORKS = {
-  mainnet: { chainId: 1, rpc: "https://ethereum-rpc.publicnode.com" },
-  sepolia: { chainId: 11155111, rpc: "https://ethereum-sepolia-rpc.publicnode.com" },
-  polygon: { chainId: 137, rpc: "https://polygon-bor-rpc.publicnode.com" },
-  arbitrum: { chainId: 42161, rpc: "https://arbitrum-one-rpc.publicnode.com" },
-  optimism: { chainId: 10, rpc: "https://optimism-rpc.publicnode.com" },
-  base: { chainId: 8453, rpc: "https://base-rpc.publicnode.com" },
+  mainnet: { chainId: 1, rpcs: ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org", "https://rpc.flashbots.net"] },
+  sepolia: { chainId: 11155111, rpcs: ["https://ethereum-sepolia-rpc.publicnode.com", "https://1rpc.io/sepolia"] },
+  polygon: { chainId: 137, rpcs: ["https://polygon-bor-rpc.publicnode.com", "https://1rpc.io/matic"] },
+  arbitrum: { chainId: 42161, rpcs: ["https://arbitrum-one-rpc.publicnode.com", "https://1rpc.io/arb"] },
+  optimism: { chainId: 10, rpcs: ["https://optimism-rpc.publicnode.com", "https://1rpc.io/op"] },
+  base: { chainId: 8453, rpcs: ["https://base-rpc.publicnode.com", "https://1rpc.io/base"] },
 };
 const BLOCKSCOUT = {
   1: "https://eth.blockscout.com",
@@ -30,62 +31,134 @@ const BLOCKSCOUT = {
   10: "https://optimism.blockscout.com",
   8453: "https://base.blockscout.com",
 };
-
-async function fetchJSON(url) {
-  var r = await fetch(url);
-  if (!r.ok) throw new Error("HTTP " + r.status + ": " + url);
-  return r.json();
+const SOURCE_TIMEOUT_MS = 15000;
+const API_TIMEOUT_MS = 20000;
+const COMPILER_TIMEOUT_MS = 60000;
+function explainFetch(err) {
+  var cause = err && err.cause;
+  var detail = cause && (cause.code || cause.message);
+  var msg = (err && err.message) || "request failed";
+  return detail ? msg + " (" + detail + ")" : msg;
 }
-async function rpcCall(rpcUrl, method, params) {
-  var r = await fetch(rpcUrl, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: method, params: params }),
+
+function rpcLabel(url) {
+  try {
+    var u = new URL(url);
+    if (u.username || u.password || u.search) return u.origin + " (redacted)";
+    return u.origin;
+  } catch (e) {
+    return "custom-rpc";
+  }
+}
+
+// Results for the Ethereum methods used here must be hex data. "0x" is the
+// authoritative "no code" answer, so null or any non-hex value marks a broken
+// endpoint and must trigger failover instead of pinning that endpoint.
+const HEX_DATA = /^0x(?:[0-9a-fA-F]{2})*$/;
+const HEX_QUANTITY_OR_DATA = /^0x[0-9a-fA-F]*$/;
+const RPC_RESULT_CHECKS = {
+  eth_getCode: function(r) { return typeof r === "string" && HEX_DATA.test(r); },
+  eth_getStorageAt: function(r) { return typeof r === "string" && r.length > 2 && HEX_QUANTITY_OR_DATA.test(r); },
+};
+
+async function rpcOnce(rpcUrl, method, params, fetchImpl) {
+  var opened = await fetchBounded(rpcUrl, API_TIMEOUT_MS, fetchImpl || fetch, {
+    read: "json",
+    options: {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: method, params: params }),
+    },
   });
-  var d = await r.json();
-  if (d.error) throw new Error("RPC: " + d.error.message);
+  if (!opened.ok) throw new Error("HTTP " + opened.status);
+  var d = opened.data;
+  if (!d || typeof d !== "object" || Array.isArray(d)) throw new Error("RPC: empty response");
+  if (d.error) throw new Error("RPC: " + (d.error.message || d.error.code));
+  if (!Object.prototype.hasOwnProperty.call(d, "result")) throw new Error("RPC: missing result");
+  var check = RPC_RESULT_CHECKS[method];
+  if (check && !check(d.result)) throw new Error("RPC: invalid result for " + method);
   return d.result;
 }
 
-async function trySourcify(chainId, address) {
-  var addr = address.toLowerCase();
-  var matches = ["full_match", "partial_match"];
-  for (var i = 0; i < matches.length; i++) {
-    try {
-      var url = "https://repo.sourcify.dev/contracts/" + matches[i] + "/" + chainId + "/" + addr + "/metadata.json";
-      var r = await fetch(url);
-      if (!r.ok) continue;
-      var meta = await r.json();
-      var settings = meta.settings || {};
-      var target = Object.entries(settings.compilationTarget || {});
-      var cName = target.length ? target[0][1] : "";
-      var sources = {};
-      var entries = Object.entries(meta.sources || {});
-      for (var j = 0; j < entries.length; j++) {
-        var p = entries[j][0], s = entries[j][1];
-        if (s.content) { sources[p] = { content: s.content }; continue; }
-        var srcR = await fetch("https://repo.sourcify.dev/contracts/" + matches[i] + "/" + chainId + "/" + addr + "/sources/" + p);
-        if (srcR.ok) sources[p] = { content: await srcR.text() };
+export function createRpc(urls, fetchImpl) {
+  var list = urls.slice();
+  var pinned = -1;
+  return async function(method, params) {
+    var order = [];
+    if (pinned >= 0) order.push(pinned);
+    for (var i = 0; i < list.length; i++) {
+      if (i !== pinned) order.push(i);
+    }
+    var errors = [];
+    for (var n = 0; n < order.length; n++) {
+      var idx = order[n];
+      try {
+        var result = await rpcOnce(list[idx], method, params, fetchImpl);
+        if (idx !== 0 && pinned !== idx) info("rpc=" + rpcLabel(list[idx]));
+        pinned = idx;
+        return result;
+      } catch (e) {
+        errors.push(rpcLabel(list[idx]) + " -> " + explainFetch(e));
       }
-      var opt = settings.optimizer || {};
-      return {
-        provider: "sourcify", contractName: cName,
-        compilerVersion: (meta.compiler && meta.compiler.version || "").replace(/^v/, ""),
-        optimizationUsed: !!opt.enabled, runs: opt.runs || 200,
-        evmVersion: settings.evmVersion || "default", sources: sources, settings: settings,
-      };
-    } catch (e) { continue; }
-  }
-  return null;
+    }
+    throw new Error("RPC failed: " + errors.join("; "));
+  };
 }
 
-async function tryBlockscout(chainId, address) {
+function sourcifyArtifact(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  if (data.runtimeMatch !== "exact_match" && data.runtimeMatch !== "match") return null;
+  var compilation = data.compilation || {};
+  var version = String(compilation.compilerVersion || "").replace(/^v/, "");
+  var entries = Object.entries(data.sources || {});
+  if (!version || !entries.length) return null;
+  var sources = {};
+  for (var i = 0; i < entries.length; i++) {
+    var content = entries[i][1] && entries[i][1].content;
+    if (typeof content !== "string" || content.length === 0) return null;
+    sources[entries[i][0]] = { content: content };
+  }
+  var settings = compilation.compilerSettings || {};
+  var opt = settings.optimizer || {};
+  var cName = compilation.name || "";
+  if (!cName && compilation.fullyQualifiedName) {
+    var parts = String(compilation.fullyQualifiedName).split(":");
+    cName = parts[parts.length - 1] || "";
+  }
+  return {
+    provider: "sourcify", contractName: cName,
+    compilerVersion: version,
+    optimizationUsed: !!opt.enabled, runs: opt.runs || 200,
+    evmVersion: settings.evmVersion || "default", sources: sources, settings: settings,
+  };
+}
+
+async function trySourcify(chainId, address, fetchImpl = fetch, timeoutMs = SOURCE_TIMEOUT_MS) {
+  var addr = address.toLowerCase();
+  var url = "https://sourcify.dev/server/v2/contract/" + chainId + "/" + addr + "?fields=sources,compilation";
+  try {
+    var opened = await fetchBounded(url, timeoutMs, fetchImpl, { read: "json" });
+    if (!opened.ok) {
+      if (!opened.status || opened.status >= 500) info("Sourcify unavailable: HTTP " + opened.status);
+      return null;
+    }
+    var artifact = sourcifyArtifact(opened.data);
+    if (!artifact) info("Sourcify artifact is not a complete runtime match");
+    return artifact;
+  } catch (e) {
+    info("Sourcify unavailable: " + explainFetch(e));
+    return null;
+  }
+}
+
+async function tryBlockscout(chainId, address, fetchImpl = fetch, timeoutMs = API_TIMEOUT_MS) {
   var base = BLOCKSCOUT[chainId];
   if (!base) return null;
   try {
     var url = base + "/api/v2/smart-contracts/" + address;
-    var r = await fetch(url);
-    if (!r.ok) return null;
-    var d = await r.json();
+    var opened = await fetchBounded(url, timeoutMs, fetchImpl, { read: "json" });
+    if (!opened.ok) return null;
+    var d = opened.data || {};
     if (!d.source_code) return null;
     var name = d.name || "Contract";
     return {
@@ -97,14 +170,19 @@ async function tryBlockscout(chainId, address) {
       sources: {}, settings: {},
       sourceCode: d.source_code,
     };
-  } catch (e) { return null; }
+  } catch (e) {
+    info("Blockscout unavailable: " + explainFetch(e));
+    return null;
+  }
 }
 
-async function tryEtherscan(chainId, address, apiKey) {
+async function tryEtherscan(chainId, address, apiKey, fetchImpl = fetch, timeoutMs = API_TIMEOUT_MS) {
   if (!apiKey) return null;
   try {
     var url = "https://api.etherscan.io/v2/api?chainid=" + chainId + "&module=contract&action=getsourcecode&address=" + address + "&apikey=" + apiKey;
-    var d = await fetchJSON(url);
+    var opened = await fetchBounded(url, timeoutMs, fetchImpl, { read: "json" });
+    if (!opened.ok) return null;
+    var d = opened.data || {};
     var r0 = d.result && d.result[0];
     if (!r0 || !r0.SourceCode || !r0.ContractName) return null;
     var raw = r0.SourceCode;
@@ -130,6 +208,16 @@ async function tryEtherscan(chainId, address, apiKey) {
   } catch (e) { return null; }
 }
 
+export async function loadVerifiedSource(chainId, address, etherscanKey, options) {
+  var fetchImpl = (options && options.fetchImpl) || fetch;
+  var sourcifyTimeoutMs = (options && options.sourcifyTimeoutMs) || SOURCE_TIMEOUT_MS;
+  var blockscoutTimeoutMs = (options && options.blockscoutTimeoutMs) || API_TIMEOUT_MS;
+  var src = await trySourcify(chainId, address, fetchImpl, sourcifyTimeoutMs);
+  if (!src) { info("Trying Blockscout..."); src = await tryBlockscout(chainId, address, fetchImpl, blockscoutTimeoutMs); }
+  if (!src && etherscanKey) { info("Trying Etherscan..."); src = await tryEtherscan(chainId, address, etherscanKey, fetchImpl); }
+  return src;
+}
+
 async function downloadSolc(version) {
   var ver = version.split("+")[0];
   var dir = join(tmpdir(), "eth-deploy-verify");
@@ -137,12 +225,16 @@ async function downloadSolc(version) {
   var solcPath = join(dir, "soljson-" + ver + ".js");
   if (existsSync(solcPath)) { info("solc " + ver + " cached"); return solcPath; }
   info("Downloading solc-js " + ver + "...");
-  var list = await fetchJSON("https://binaries.soliditylang.org/bin/list.json");
+  var listUrl = "https://binaries.soliditylang.org/bin/list.json";
+  var listOpened = await fetchBounded(listUrl, API_TIMEOUT_MS, fetch, { read: "json" });
+  if (!listOpened.ok) throw new Error("HTTP " + listOpened.status + ": " + listUrl);
+  var list = listOpened.data || {};
   var file = list.releases && list.releases[ver];
   if (!file) throw new Error("solc " + ver + " not in releases");
-  var resp = await fetch("https://binaries.soliditylang.org/bin/" + file);
-  if (!resp.ok) throw new Error("solc download failed: " + resp.status);
-  writeFileSync(solcPath, Buffer.from(await resp.arrayBuffer()));
+  var binaryUrl = "https://binaries.soliditylang.org/bin/" + file;
+  var binaryOpened = await fetchBounded(binaryUrl, COMPILER_TIMEOUT_MS, fetch, { read: "buffer" });
+  if (!binaryOpened.ok) throw new Error("solc download failed: " + binaryOpened.status);
+  writeFileSync(solcPath, Buffer.from(binaryOpened.data));
   info("solc " + ver + " ready");
   return solcPath;
 }
@@ -219,8 +311,8 @@ function stripMeta(bytecode) {
   return hex;
 }
 
-function keccak(hex) {
-  return createHash("sha256").update(hex).digest("hex").slice(0, 16);
+export function fingerprint(hex) {
+  return createHash("sha256").update(String(hex)).digest("hex").slice(0, 16);
 }
 
 function pickBestMatch(onChainHex, candidates) {
@@ -245,7 +337,7 @@ async function main() {
   if (!address) die("Missing address");
   var net = NETWORKS[network.toLowerCase()];
   if (!net) die("Unknown network: " + network);
-  if (!rpcUrl) rpcUrl = net.rpc;
+  var rpc = createRpc(rpcUrl ? [rpcUrl] : net.rpcs);
 
   var sep = "========================================================";
   console.log("\n" + sep);
@@ -257,16 +349,14 @@ async function main() {
 
   try {
     info("Fetching verified source...");
-    var src = await trySourcify(net.chainId, address);
-    if (!src) { info("Not on Sourcify, trying Blockscout..."); src = await tryBlockscout(net.chainId, address); }
-    if (!src && etherscanKey) { info("Not on Blockscout, trying Etherscan..."); src = await tryEtherscan(net.chainId, address, etherscanKey); }
+    var src = await loadVerifiedSource(net.chainId, address, etherscanKey);
     if (!src) die("Source not found on any provider. Is contract verified?");
     info("provider=" + src.provider + " contract=" + src.contractName + " solc=" + src.compilerVersion);
     var optStr = src.optimizationUsed ? "on(" + src.runs + ")" : "off";
     info("optimizer=" + optStr + " evm=" + src.evmVersion);
 
     info("Fetching on-chain bytecode...");
-    var onChain = await rpcCall(rpcUrl, "eth_getCode", [address, "latest"]);
+    var onChain = await rpc("eth_getCode", [address, "latest"]);
     if (!onChain || onChain === "0x") die("No bytecode at address");
     info("on-chain: " + ((onChain.length - 2) / 2) + " bytes");
 
@@ -282,7 +372,7 @@ async function main() {
       contractName: src.contractName,
       blockscout: blockscoutProxy,
       readStorage: function(slot) {
-        return rpcCall(rpcUrl, "eth_getStorageAt", [address, slot, "latest"]);
+        return rpc("eth_getStorageAt", [address, slot, "latest"]);
       },
     });
     if (proxy.isProxy) {
@@ -338,7 +428,7 @@ async function main() {
       console.log("  provider=" + src.provider);
       console.log("  solc=" + src.compilerVersion);
       console.log("  contract=" + result.name);
-      console.log("  keccak=" + keccak(onStrip));
+      console.log("  fingerprint=" + fingerprint(onStrip));
       setOutput("status", "PASS");
     } else {
       console.log("  FAIL: bytecode mismatch");
@@ -347,8 +437,8 @@ async function main() {
       console.log("  closest_contract=" + result.name);
       console.log("  onchain_len=" + (onStrip.length / 2));
       console.log("  compiled_len=" + (comStrip.length / 2));
-      console.log("  onchain_keccak=" + keccak(onStrip));
-      console.log("  compiled_keccak=" + keccak(comStrip));
+      console.log("  onchain_fingerprint=" + fingerprint(onStrip));
+      console.log("  compiled_fingerprint=" + fingerprint(comStrip));
       // Find first diff byte
       var firstDiff = -1;
       for (var d = 0; d < Math.min(onStrip.length, comStrip.length); d += 2) {
@@ -357,8 +447,8 @@ async function main() {
       console.log("  first_diff_at=byte " + firstDiff + " (of " + (onStrip.length/2) + ")");
       setOutput("status", "FAIL");
     }
-    setOutput("on-chain-hash", keccak(onStrip));
-    setOutput("compiled-hash", keccak(comStrip));
+    setOutput("on-chain-hash", fingerprint(onStrip));
+    setOutput("compiled-hash", fingerprint(comStrip));
     console.log(sep + "\n");
     if (!result.match) process.exit(1);
   } catch (err) {
@@ -366,4 +456,21 @@ async function main() {
   }
 }
 
-main();
+function samePath(left, right) {
+  return String(left).toLowerCase() === String(right).toLowerCase();
+}
+
+function isDirectRun() {
+  var entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    var modulePath = fileURLToPath(import.meta.url);
+    var invokedPath = resolve(entry);
+    if (samePath(modulePath, invokedPath)) return true;
+    return samePath(realpathSync(modulePath), realpathSync(invokedPath));
+  } catch (e) {
+    return false;
+  }
+}
+
+if (isDirectRun()) main();
